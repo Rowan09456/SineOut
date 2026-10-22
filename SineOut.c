@@ -2,70 +2,142 @@
 #include <math.h>
 #include "pico/stdlib.h"
 #include "hardware/pwm.h"
-#include "hardware/irq.h"
 #include "hardware/clocks.h"
 #include "pico/cyw43_arch.h"
 
-#define PWM_PIN     15
-#define TOP         1023          // 10-bit resolution, ~146 kHz carrier
-#define TABLE_SIZE  256
-#define F_OUT       1000.0        // sine frequency in Hz
+#define PWM_PIN 16          // Target GPIO pin
+#define CARRIER_FREQ 100000 // 100 kHz high-frequency PWM carrier
+//#define SINE_FREQ 60.0      // Target low-frequency sine wave (10 Hz)
+#define SAMPLE_RATE 2000    // Update duty cycle 2000 times per second
 
-static uint16_t sine_table[TABLE_SIZE];
-static uint slice;
-static uint32_t phase = 0, phase_inc;
+static float wave_freq = 50.0; // Default sine wave frequency
+static uint32_t sample_idx = 0;
 
-// Runs once per PWM cycle; kept in RAM so it never waits on flash
-static void __not_in_flash_func(on_pwm_wrap)(void) {
-    pwm_clear_irq(slice);
-    phase += phase_inc;                                   // wraps naturally at 2^32
-    pwm_set_gpio_level(PWM_PIN, sine_table[phase >> 24]); // top 8 bits = table index
+uint16_t pwm_wrap_val;
+uint slice_num;
+uint chan;
+enum pwm_output{
+    PWM_SINE =0,
+    PWM_SQUARE,
+    PWM_SAWTOOTH,
+    PWM_TRIANGLE,
+    PWM_COMPOSITE        
+
+} this_pwm_output = PWM_SINE;
+
+// Timer callback to update the duty cycle
+bool timer_callback(repeating_timer_t *rt) {
+
+    float sine_val, square_val, sawtooth_val, triangle_val, composite_val;
+    // Calculate current angle
+    float time = (float)sample_idx / SAMPLE_RATE;
+    float pwm_output = 0.0f;
+    sine_val = sinf(2.0f * M_PI * wave_freq * time);
+    if(sine_val < 0.0f) {
+        square_val = 1.0f; // Ensure non-negative for PWM
+    } else { square_val = 0.0f; }
+    sawtooth_val = 2.0f * (time * wave_freq - floorf(time * wave_freq + 0.5f)); // Sawtooth from -1 to 1
+    triangle_val = 2.0f * fabsf(sawtooth_val) - 1.0f; // Triangle from -1 to 1
+    composite_val = sine_val + 0.1f * (sinf(4.0f * M_PI * wave_freq * time) + 
+                    sinf(6.0f * M_PI * wave_freq * time) +
+                    sinf(10.0f * M_PI * wave_freq * time) +
+                    sinf(14.0f * M_PI * wave_freq * time) +
+                    sinf(50.0f * M_PI * wave_freq * time) +
+                    sinf(70.0f * M_PI * wave_freq * time) +
+                    sinf(100.0f * M_PI * wave_freq * time));  
+    
+    // Scale sine wave (-1.0 to 1.0) to PWM duty cycle (0 to pwm_wrap_val)
+    switch(this_pwm_output) {
+        case PWM_SINE:
+            pwm_output = (sine_val + 1.0f) * 0.5f; // Scale to 0..1
+            break;
+        case PWM_SQUARE:
+            pwm_output = square_val; // Already 0 or 1
+            break;
+        case PWM_SAWTOOTH:
+            pwm_output = (sawtooth_val + 1.0f) * 0.5f; // Scale to 0..1
+            break;
+        case PWM_TRIANGLE:
+            pwm_output = (triangle_val + 1.0f) * 0.5f; // Scale to 0..1
+            break;
+        case PWM_COMPOSITE:
+            pwm_output = (composite_val + 1.0f) * 0.5f; // Scale to 0..1
+            break;
+    }
+
+    uint16_t level = (uint16_t)(pwm_output * pwm_wrap_val);
+    
+    // Update the hardware channel level
+    pwm_set_chan_level(slice_num, chan, level);
+    
+    sample_idx++;
+    if (sample_idx >= SAMPLE_RATE) sample_idx = 0; // Prevent overflow
+    
+    return true; // Keep timer running
 }
 
-
-
-
-int main()
-{
-    // Sine table scaled to 0..TOP, centred on TOP/2
-    for (int i = 0; i < TABLE_SIZE; i++)
-        sine_table[i] = (uint16_t)((sin(2 * M_PI * i / TABLE_SIZE) + 1.0) * 0.5 * TOP + 0.5);
-
+int main() {
     stdio_init_all();
-
-    // Initialise the Wi-Fi chip
-    if (cyw43_arch_init()) {
+     if (cyw43_arch_init()) {
         printf("Wi-Fi init failed\n");
         return -1;
     }
 
-    printf("System Clock Frequency is %d Hz\n", clock_get_hz(clk_sys));
-    printf("USB Clock Frequency is %d Hz\n", clock_get_hz(clk_usb));
-    // For more examples of clocks use see https://github.com/raspberrypi/pico-examples/tree/master/clocks
-
-    // Example to turn on the Pico W LED
-    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+    // 1. Setup PWM Pin & Slice
     gpio_set_function(PWM_PIN, GPIO_FUNC_PWM);
-    slice = pwm_gpio_to_slice_num(PWM_PIN);
+    slice_num = pwm_gpio_to_slice_num(PWM_PIN);
+    chan = pwm_gpio_to_channel(PWM_PIN);
 
-    pwm_config cfg = pwm_get_default_config();
-    pwm_config_set_clkdiv(&cfg, 1.0f);
-    pwm_config_set_wrap(&cfg, TOP);
-    pwm_init(slice, &cfg, false);
+    // 2. Calculate Clock Divider and Wrap for 100 kHz carrier frequency
+    uint32_t sys_clk = clock_get_hz(clk_sys);
+    
+    // Let's use a standard wrap of 1000 for good duty cycle resolution
+    pwm_wrap_val = 1000; 
+    float clk_div = (float)sys_clk / (CARRIER_FREQ * (pwm_wrap_val + 1));
+    
+    pwm_set_clkdiv(slice_num, clk_div);
+    pwm_set_wrap(slice_num, pwm_wrap_val);
+    pwm_set_enabled(slice_num, true);
 
-    double fs = clock_get_hz(clk_sys) / (double)(TOP + 1);   // sample rate
-    phase_inc = (uint32_t)(F_OUT / fs * 4294967296.0);       // F_OUT / fs × 2^32
+    // 3. Setup a Repeating Timer for changing the duty cycle
+    repeating_timer_t timer;
+    int32_t delay_us = -(1000000 / SAMPLE_RATE); // Negative value ensures strict timing
+    add_repeating_timer_us(delay_us, timer_callback, NULL, &timer);
 
-    pwm_clear_irq(slice);
-    pwm_set_irq_enabled(slice, true);
-    irq_set_exclusive_handler(PWM_IRQ_WRAP, on_pwm_wrap);
-    irq_set_enabled(PWM_IRQ_WRAP, true);
-    pwm_set_enabled(slice, true);
+    printf("Generating %g Hz sine wave on pin %d\n", wave_freq, PWM_PIN);
+    printf("Press 1 for sine, 2 for square, 3 for sawtooth, 4 for triangle, 5 for composite\n");
+    printf("Press 0 to change frequency (enter new frequency in Hz)\n");
+    int i=0;
 
+    while (1) {
+        int ch = getchar_timeout_us(0);
+        if (ch >= '1' && ch <= '5') {
+            switch (ch) {
+                case '1': this_pwm_output = PWM_SINE; printf("Generating %g Hz sine wave on pin %d\n", wave_freq, PWM_PIN);break;
+                case '2': this_pwm_output = PWM_SQUARE; printf("Generating %g Hz square wave on pin %d\n", wave_freq, PWM_PIN);break;
+                case '3': this_pwm_output = PWM_SAWTOOTH; printf("Generating %g Hz sawtooth wave on pin %d\n", wave_freq, PWM_PIN);break;
+                case '4': this_pwm_output = PWM_TRIANGLE; printf("Generating %g Hz triangle wave on pin %d\n", wave_freq, PWM_PIN);break;
+                case '5': this_pwm_output = PWM_COMPOSITE; printf("Generating %g Hz composite wave on pin %d\n", wave_freq, PWM_PIN);break;
+            }
+            printf("Press 1 for sine, 2 for square, 3 for sawtooth, 4 for triangle, 5 for composite\n");
+            printf("Press 0 to change frequency (enter new frequency in Hz)\n");
+ 
+        } else if (ch == '0') {
+            printf("Enter new frequency in Hz: ");
+            float new_freq;
+            scanf("%f", &new_freq);
+            wave_freq = new_freq;
+            printf("Frequency changed to %g Hz\n", wave_freq);
+            printf("Press 1 for sine, 2 for square, 3 for sawtooth, 4 for triangle, 5 for composite\n");
+            printf("Press 0 to change frequency (enter new frequency in Hz)\n");
 
-    while (true) {
-        printf("Hello, world!\n");
-        sleep_ms(1000);
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, !cyw43_arch_gpio_get(CYW43_WL_GPIO_LED_PIN));
+        }
+        sleep_ms(100);
+        i++;
+        if(i==10){
+            i=0;
+            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, !cyw43_arch_gpio_get(CYW43_WL_GPIO_LED_PIN));
+        }
+        
     }
 }
